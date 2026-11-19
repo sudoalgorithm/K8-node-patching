@@ -4,6 +4,8 @@ A step-by-step runbook for patching Kubernetes nodes on RHEL-family hosts: apply
 
 > **Golden rule:** patch **one node at a time** — fully drain → patch → reboot → verify `Ready` → uncordon — before touching the next. Never patch two nodes in parallel.
 
+For kubelet credentials, see the [kubelet client certificate rotation runbook](docs/kubelet-client-certificate-rotation.md) for enabling rotation, verifying renewal, and monitoring expiry.
+
 ---
 
 ## Placeholders
