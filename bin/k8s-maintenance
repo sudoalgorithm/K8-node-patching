@@ -1,0 +1,951 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR/..
+set -e -u -o pipefail
+umask 077
+export LC_ALL=C
+
+PROJECT_ROOT=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+declare -r PROJECT_ROOT
+
+# shellcheck source=hack/utils.bash
+source "$PROJECT_ROOT/hack/utils.bash"
+
+declare -r LOCK_NAME=k8s-maintenance-lock
+declare -r HOLD_KEY=k8s-maintenance/hold
+
+declare RUN_DIR=''
+declare TICKET_FILE=''
+declare NODE_NAME=''
+declare NODE_IP=''
+declare ACTION_FILE=''
+declare CHECK_FILE=''
+declare REBOOT_REQUIRED=0
+declare RETRY_ACTION=0
+declare KUBE_CONTEXT=''
+declare KUBECONFIG_FILE=''
+declare SUDO_KUBECTL=0
+declare ALLOWED_ISSUES_FILE=''
+declare ALLOW_EMPTYDIR=0
+declare WAIT_SECONDS=300
+declare DRAIN_SECONDS=600
+
+cleanup() {
+	local status=$?
+	rmdir -- "$RUN_DIR/.busy" || :
+	if ((status != 0)); then
+		printf 'Evidence for %s: %s\n' "$PHASE" "$EVIDENCE_DIR" >&2
+	fi
+}
+
+privileged() {
+	if ((EUID == 0)); then
+		"$@"
+	else
+		sudo "$@"
+	fi
+}
+
+record() {
+	local file=$1
+	shift
+	"$@" 2>&1 | tee -- "$file"
+}
+
+valid_uuid() {
+	[[ $1 =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]
+}
+
+validate_host_inputs() {
+	[[ ${#NODE_NAME} -le 253 && $NODE_NAME =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] ||
+		die 'Use the exact Kubernetes node name.'
+	[[ $NODE_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die 'Use the node InternalIP in IPv4 form.'
+}
+
+host_identity() {
+	[[ $(uname -s) == Linux ]] || die 'Run host phases on the Linux worker.'
+	ip -o -4 addr show scope global | awk -v expected="$NODE_IP" '
+		{
+			split($4, a, "/")
+			if (a[1] == expected) found=1
+		}
+		END { exit !found }
+	' || die "This host does not own $NODE_IP."
+	HOST_BOOT=$(cat /proc/sys/kernel/random/boot_id)
+	valid_uuid "$HOST_BOOT" || die 'Unable to read the local boot ID.'
+}
+
+load_prepared() {
+	local mark
+	[[ -s $1 ]] || die "Missing prepare ticket: $1"
+	PREPARED_TICKET=$(cat -- "$1")
+	IFS='|' read -r mark RUN_ID NODE_NAME NODE_IP BASE_BOOT BASE_KERNEL REBOOT_REQUIRED <<<"$PREPARED_TICKET"
+	[[ $mark == prepared-maintenance-v1 ]] || die 'Unknown prepare ticket type.'
+	if ! valid_uuid "$RUN_ID" || ! valid_uuid "$BASE_BOOT"; then
+		die 'Invalid prepare ticket identity.'
+	fi
+	validate_host_inputs
+	[[ $BASE_KERNEL =~ ^[0-9][[:alnum:].+_-]*$ ]] || die 'Invalid worker kernel in prepare ticket.'
+	[[ $REBOOT_REQUIRED == 0 || $REBOOT_REQUIRED == 1 ]] || die 'Invalid maintenance reboot flag.'
+	[[ $PREPARED_TICKET == "$mark|$RUN_ID|$NODE_NAME|$NODE_IP|$BASE_BOOT|$BASE_KERNEL|$REBOOT_REQUIRED" ]] ||
+		die 'Invalid maintenance prepare ticket fields.'
+}
+
+write_prepared() {
+	local id
+	id=$(cat /proc/sys/kernel/random/uuid)
+	valid_uuid "$id" || die 'Unable to generate a run identifier.'
+	printf 'prepared-maintenance-v1|%s|%s|%s|%s|%s|%s\n' \
+		"$id" "$NODE_NAME" "$NODE_IP" "$HOST_BOOT" "$BASE_KERNEL" "$REBOOT_REQUIRED" >"$EVIDENCE_DIR/prepared.ticket"
+}
+
+load_drain_ticket() {
+	DRAIN_TICKET=$(cat -- "$1")
+	IFS='|' read -r _ DRAIN_UID _ <<<"$DRAIN_TICKET"
+	if ! valid_uuid "$DRAIN_UID" || [[ $DRAIN_TICKET != "drained-v2|$DRAIN_UID|$PREPARED_TICKET" ]]; then
+		die 'Drain ticket belongs to a different worker run or an older CLI.'
+	fi
+}
+
+require_drained_worker() {
+	host_identity
+	[[ $HOST_BOOT == "$BASE_BOOT" && $(uname -r) == "$BASE_KERNEL" ]] ||
+		die 'The worker boot or running kernel has changed since prepare.'
+	load_drain_ticket "$TICKET_FILE"
+	if [[ -e $EVIDENCE_DIR/drained.ticket ]]; then
+		[[ $(<"$EVIDENCE_DIR/drained.ticket") == "$DRAIN_TICKET" ]] || die 'This worker run already accepted a different drain.'
+	else
+		[[ ! -e $RUN_DIR/action-started && ! -e $RUN_DIR/applied ]] || die 'Missing the drain ticket for an action already started.'
+		printf '%s\n' "$DRAIN_TICKET" >"$RUN_DIR/drained.tmp"
+		mv -- "$RUN_DIR/drained.tmp" "$EVIDENCE_DIR/drained.ticket"
+	fi
+}
+
+write_verified() {
+	printf 'verified-v2|%s|%s\n' "$HOST_BOOT" "$DRAIN_TICKET" >"$RUN_DIR/verified.tmp"
+	mv -- "$RUN_DIR/verified.tmp" "$EVIDENCE_DIR/verified.ticket"
+	ok 'Host verification passed.'
+	info "Send $EVIDENCE_DIR/verified.ticket to the Kubernetes admin session."
+}
+
+stage_script() {
+	local source_file=$1 destination=$2
+	if [[ $source_file ]]; then
+		[[ -f $source_file && -r $source_file ]] || die "Cannot read Bash script: $source_file"
+		cp -- "$source_file" "$destination"
+	else
+		printf ':\n' >"$destination"
+	fi
+	bash -n -- "$destination"
+}
+
+verify_scripts() {
+	local actual expected
+	expected=$(cat -- "$EVIDENCE_DIR/maintenance-scripts.sha256")
+	actual=$(cd -- "$RUN_DIR" && sha256sum -- action.sh check.sh)
+	[[ $actual == "$expected" ]] || die 'The staged scripts or their checksum file changed since prepare.'
+}
+
+cmd_prepare() {
+	local filesystem
+	header "Prepare worker maintenance"
+
+	validate_host_inputs
+	host_identity
+	if ((REBOOT_REQUIRED)); then
+		filesystem=$(stat -f -c %T -- "$RUN_DIR")
+		case "$RUN_DIR/" in
+		/tmp/* | /run/*) die 'Use a persistent worker run directory outside /tmp and /run for a reboot.' ;;
+		esac
+		case "$filesystem" in
+		tmpfs | ramfs) die 'Use a persistent worker filesystem for a reboot.' ;;
+		esac
+	fi
+	BASE_KERNEL=$(uname -r)
+	stage_script "$ACTION_FILE" "$RUN_DIR/action.sh"
+	stage_script "$CHECK_FILE" "$RUN_DIR/check.sh"
+	(cd -- "$RUN_DIR" && sha256sum -- action.sh check.sh) >"$EVIDENCE_DIR/maintenance-scripts.sha256"
+	write_prepared
+	ok "Prepared $NODE_NAME ($NODE_IP)."
+	info "Send $EVIDENCE_DIR/prepared.ticket to the Kubernetes admin session."
+}
+
+cmd_apply() {
+	header "Run worker maintenance"
+
+	require_drained_worker
+	if [[ ! -e $RUN_DIR/applied ]]; then
+		if [[ -e $RUN_DIR/action-started ]] && ((! RETRY_ACTION)); then
+			die 'The previous action did not finish successfully. Review its effects and use --retry-action only when it is safe to rerun.'
+		fi
+		verify_scripts
+		touch "$RUN_DIR/action-started"
+		MAINTENANCE_NODE="$NODE_NAME" MAINTENANCE_IP="$NODE_IP" record "$EVIDENCE_DIR/maintenance-action.txt" bash -- "$RUN_DIR/action.sh" ||
+			die 'The maintenance action failed. Keep the maintenance hold in place and review maintenance-action.txt.'
+		touch "$RUN_DIR/applied"
+	fi
+	if ((REBOOT_REQUIRED)); then
+		[[ ! -e $RUN_DIR/reboot-requested ]] || die 'Reboot was already requested. Verify after reconnecting or explicitly retry reboot.'
+		cmd_reboot
+	else
+		cmd_verify
+	fi
+}
+
+cmd_reboot() {
+	header "Reboot the worker"
+	load_drain_ticket "$EVIDENCE_DIR/drained.ticket"
+
+	host_identity
+	[[ $REBOOT_REQUIRED == 1 && -e $RUN_DIR/applied && $HOST_BOOT == "$BASE_BOOT" ]] ||
+		die 'Reboot requires a successful maintenance action and the --reboot option from prepare.'
+	verify_scripts
+	touch "$RUN_DIR/reboot-requested"
+	info "Rebooting $NODE_NAME ($NODE_IP)."
+	info "Reconnect and run verify with --run $RUN_DIR."
+	privileged systemctl reboot
+}
+
+cmd_verify() {
+	header "Verify worker maintenance"
+
+	rm -f -- "$EVIDENCE_DIR/verified.ticket"
+	load_drain_ticket "$EVIDENCE_DIR/drained.ticket"
+	host_identity
+	[[ -e $RUN_DIR/applied ]] || die 'Complete the maintenance action before verification.'
+	if ((REBOOT_REQUIRED)); then
+		[[ -e $RUN_DIR/reboot-requested && $HOST_BOOT != "$BASE_BOOT" ]] ||
+			die 'No new boot after the reboot request.'
+	else
+		[[ $HOST_BOOT == "$BASE_BOOT" ]] || die 'The worker rebooted unexpectedly during maintenance.'
+	fi
+	verify_scripts
+	MAINTENANCE_NODE="$NODE_NAME" MAINTENANCE_IP="$NODE_IP" record "$EVIDENCE_DIR/maintenance-check.txt" bash -- "$RUN_DIR/check.sh" ||
+		die 'The maintenance check failed. Keep the maintenance hold in place and retry verify after addressing the failure.'
+	write_verified
+}
+
+cmd_archive() {
+	local directory archive
+	header "Archive maintenance evidence"
+
+	directory=$(mktemp -d "$RUN_DIR/archive.XXXXXXXX")
+	archive="$directory/evidence.tar.gz"
+	tar -czf "$archive" -C "$RUN_DIR" evidence
+	(cd -- "$directory" && sha256sum -- evidence.tar.gz >evidence.tar.gz.sha256)
+	printf '%s\n' "$archive" "$archive.sha256"
+}
+
+kube() {
+	local executable
+	local -a args
+	executable=$(command -v kubectl) || {
+		echo 'kubectl is required in the Kubernetes admin session.' >&2
+		return 1
+	}
+	args=("$executable" --context="$KUBE_CONTEXT" --request-timeout=30s)
+	if [[ $KUBECONFIG_FILE ]]; then
+		args+=(--kubeconfig="$KUBECONFIG_FILE")
+	fi
+	if ((SUDO_KUBECTL)); then
+		privileged "${args[@]}" "$@"
+	else
+		"${args[@]}" "$@"
+	fi
+}
+
+cluster_uid() {
+	kube get namespace kube-system -o jsonpath='{.metadata.uid}'
+}
+
+load_cluster() {
+	local expected
+	[[ -e $RUN_DIR/inspected ]] || die 'Complete inspect before proceeding.'
+	load_prepared "$EVIDENCE_DIR/prepared.ticket"
+	KUBE_CONTEXT=$(cat "$RUN_DIR/context")
+	KUBECONFIG_FILE=$(cat "$RUN_DIR/kubeconfig")
+	SUDO_KUBECTL=$(cat "$RUN_DIR/sudo-kubectl")
+	[[ -s $RUN_DIR/admin-id ]] || die 'This admin run predates owned scheduling holds. Review its reservation and scheduling manually.'
+	ADMIN_ID=$(cat "$RUN_DIR/admin-id")
+	[[ $ADMIN_ID =~ ^[[:xdigit:]]{32}$ ]] || die 'Invalid admin run identity.'
+	expected=$(cat "$EVIDENCE_DIR/cluster-uid.txt")
+	[[ $(cluster_uid) == "$expected" ]] || die 'The selected kubeconfig points to a different cluster.'
+}
+
+node_info() {
+	local info
+	# shellcheck disable=SC2016
+	info=$(kube get node "$NODE_NAME" -o go-template='{{.metadata.uid}}|{{.status.nodeInfo.bootID}}|{{.status.nodeInfo.kernelVersion}}|{{if .spec.unschedulable}}cordoned{{else}}schedulable{{end}}|{{.metadata.resourceVersion}}|{{if .spec.taints}}list{{end}}|{{range $i, $t := .spec.taints}}{{if and (eq $t.key "k8s-maintenance/hold") (eq $t.effect "NoSchedule")}}{{$i}}={{or $t.value ""}},{{end}}{{end}}{{"\n"}}
+{{range .status.addresses}}{{if eq .type "InternalIP"}}ip={{.address}}{{"\n"}}{{end}}{{end}}
+{{range $key, $value := .metadata.labels}}{{if or (eq $key "node-role.kubernetes.io/control-plane") (eq $key "node-role.kubernetes.io/master")}}control-plane{{"\n"}}{{end}}{{end}}') || die 'Could not read the target node.'
+	IFS='|' read -r NODE_UID NODE_BOOT NODE_KERNEL SCHEDULING NODE_VERSION TAINT_LIST NODE_HOLD <<<"$info"
+	NODE_HOLD=${NODE_HOLD%,}
+	[[ $NODE_HOLD != *,* ]] || die 'Multiple maintenance holds on the worker. Review the node before proceeding.'
+	[[ $NODE_VERSION =~ ^[a-zA-Z0-9._:-]+$ ]] || die 'Missing or invalid node resource version.'
+	if ! valid_uuid "$NODE_UID" || ! grep -Fxq "ip=$NODE_IP" <<<"$info"; then
+		die "Kubernetes node $NODE_NAME does not match worker InternalIP $NODE_IP."
+	fi
+	if grep -Fxq control-plane <<<"$info"; then
+		die "$NODE_NAME is a control-plane node. Use the control-plane procedure."
+	fi
+	if [[ -e $EVIDENCE_DIR/node-uid.txt && $NODE_UID != "$(cat "$EVIDENCE_DIR/node-uid.txt")" ]]; then
+		die "Kubernetes node UID changed for $NODE_NAME."
+	fi
+}
+
+collect_health() {
+	local label=$1
+	kube get nodes -o go-template='{{range .items}}{{.metadata.name}}|{{range .status.conditions}}{{if eq .type "Ready"}}{{.status}}{{end}}{{end}}|{{if .spec.unschedulable}}cordoned{{else}}schedulable{{end}}|{{range .status.conditions}}{{if and (eq .status "True") (or (eq .type "DiskPressure") (eq .type "MemoryPressure") (eq .type "PIDPressure") (eq .type "NetworkUnavailable"))}}{{.type}},{{end}}{{end}}{{"\n"}}{{end}}' \
+		>"$EVIDENCE_DIR/$label-nodes.txt" || return 1
+	{
+		# shellcheck disable=SC2016
+		kube get pods -A -o go-template='{{range .items}}
+{{- $ready := false -}}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{$ready = true}}{{end}}{{end -}}
+{{- if and (ne .status.phase "Succeeded") (or (not $ready) .metadata.deletionTimestamp) -}}
+{{- $identity := .metadata.name -}}{{- $pod := . -}}
+{{- range .metadata.ownerReferences}}{{if and .controller (eq .kind "DaemonSet")}}{{$identity = printf "%s@%s" .name $pod.spec.nodeName}}{{end}}{{end -}}
+pod/{{.metadata.namespace}}/{{$identity}} {{if .metadata.deletionTimestamp}}Terminating{{else}}{{.status.phase}}{{end}}
+{{- range .status.initContainerStatuses}}{{with .state.waiting}} {{.reason}}{{end}}{{end}}
+{{- range .status.containerStatuses}}{{with .state.waiting}} {{.reason}}{{end}}{{end}}{{"\n"}}
+{{- end}}{{end}}' || return 1
+		kube get deployments,statefulsets,daemonsets -A -o go-template='{{range .items}}
+{{- .kind}}/{{.metadata.namespace}}/{{.metadata.name}}|
+{{- if eq .kind "DaemonSet"}}
+{{- if .status.numberReady}}{{.status.numberReady}}{{else}}0{{end}}|{{.status.desiredNumberScheduled}}
+{{- else}}
+{{- if eq .kind "Deployment"}}{{if .status.availableReplicas}}{{.status.availableReplicas}}{{else}}0{{end}}
+{{- else}}{{if .status.readyReplicas}}{{.status.readyReplicas}}{{else}}0{{end}}{{end}}|{{.spec.replicas}}
+{{- end}}{{"\n"}}{{end}}' |
+			awk -F '|' '$2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || $2+0 < $3+0 { print $1 " " $2 "/" $3 }'
+	} | sort -u >"$EVIDENCE_DIR/$label-issues.txt"
+}
+
+check_nodes() {
+	awk -F '|' -v target="$NODE_NAME" '
+		$1 == target { found=1 }
+		$2 != "True" || ($1 != target && $3 == "cordoned") || $4 != "" {
+			print "Node health gate: " $0 > "/dev/stderr"
+			bad=1
+		}
+		END { exit (bad || !found) }
+	' "$1"
+}
+
+target_pods() {
+	# shellcheck disable=SC2016
+	kube get pods -A --field-selector="spec.nodeName=$NODE_NAME" -o go-template='{{range .items}}
+{{- $pod := . -}}{{- $owner := "Unmanaged" -}}{{- $name := "-" -}}{{- $ownerUID := "" -}}{{- $api := "" -}}
+{{- range .metadata.ownerReferences}}{{if .controller}}{{$owner = .kind}}{{$name = .name}}{{$ownerUID = .uid}}{{$api = .apiVersion}}{{end}}{{end -}}
+{{- if and (eq $owner "DaemonSet") (ne $api "apps/v1")}}{{$owner = "Unmanaged"}}{{end -}}
+{{- if .metadata.annotations}}{{if index .metadata.annotations "kubernetes.io/config.mirror"}}{{$owner = "Mirror"}}{{end}}{{end -}}
+pod|{{.metadata.namespace}}|{{.metadata.name}}|{{$owner}}|{{$name}}|{{.status.phase}}|{{.metadata.uid}}|{{$ownerUID}}|{{$api}}{{if eq $owner "DaemonSet"}}|{{if not .metadata.deletionTimestamp}}{{range .status.conditions}}{{if eq .type "Ready"}}{{.status}}{{end}}{{end}}{{end}}{{end}}{{"\n"}}
+{{- if ne $owner "DaemonSet"}}
+{{- range .spec.tolerations}}{{if and (or (not .effect) (eq .effect "NoSchedule")) (or (eq .key "k8s-maintenance/hold") (and (not .key) (eq .operator "Exists")))}}toleration|{{$pod.metadata.namespace}}|{{$pod.metadata.name}}{{"\n"}}{{end}}{{end}}
+{{- range .spec.volumes}}
+{{- if ne .emptyDir nil}}emptyDir|{{$pod.metadata.namespace}}|{{$pod.metadata.name}}|{{.name}}|{{$pod.metadata.uid}}{{"\n"}}{{end}}
+{{- if ne .hostPath nil}}hostPath|{{$pod.metadata.namespace}}|{{$pod.metadata.name}}|{{.name}}{{"\n"}}{{end}}
+{{- if ne .ephemeral nil}}ephemeral|{{$pod.metadata.namespace}}|{{$pod.metadata.name}}|{{.name}}{{"\n"}}{{end}}
+{{- if ne .csi nil}}inlineCSI|{{$pod.metadata.namespace}}|{{$pod.metadata.name}}|{{.name}}{{"\n"}}{{end}}
+{{- if .persistentVolumeClaim}}pvc|{{$pod.metadata.namespace}}|{{$pod.metadata.name}}|{{.persistentVolumeClaim.claimName}}{{"\n"}}{{end}}
+{{- end}}{{end}}{{end}}' | sort -u
+}
+
+target_csi() {
+	kube get csinode "$NODE_NAME" --ignore-not-found \
+		-o go-template='{{range .spec.drivers}}{{.name}}{{"\n"}}{{end}}' | sort -u
+}
+
+node_heartbeat() {
+	kube -n kube-node-lease get lease "$NODE_NAME" -o jsonpath='{.spec.renewTime}'
+}
+
+wait_node_heartbeat() {
+	local label=$1 before current deadline=$((SECONDS + WAIT_SECONDS))
+	before=$(node_heartbeat)
+	[[ $before ]] || die "The worker has no recorded heartbeat: $NODE_NAME."
+	while ((SECONDS < deadline)); do
+		current=$(node_heartbeat)
+		if [[ $current && $current != "$before" ]]; then
+			printf 'Before: %s\nAfter: %s\n' "$before" "$current" >"$EVIDENCE_DIR/$label-heartbeat.txt"
+			return
+		fi
+		sleep 2
+	done
+	die "The worker did not renew its Kubernetes heartbeat: $NODE_NAME."
+}
+
+check_controller() {
+	local ns=$1 kind=$2 owner=$3 uid=$4 api=$5 resource=$2 current
+	local template='{{if not .metadata.deletionTimestamp}}{{.metadata.uid}}{{end}}'
+	case "$api/$kind" in
+	apps/v1/DaemonSet | apps/v1/ReplicaSet | apps/v1/StatefulSet | batch/v1/Job | v1/ReplicationController) ;;
+	*) die "Review pods with unsupported controller $api/$kind before draining." ;;
+	esac
+	valid_uuid "$uid" || die "Pod controller $ns/$kind/$owner has no UID."
+	if [[ $api == */* ]]; then
+		resource+=".${api%/*}"
+	fi
+	if [[ $kind == DaemonSet ]]; then
+		template+='{{range .spec.template.spec.tolerations}}{{"\n"}}{{or .key ""}}|{{or .operator "Equal"}}|{{or .value ""}}|{{or .effect ""}}{{end}}'
+	fi
+	current=$(kube -n "$ns" get "$resource" "$owner" -o "go-template=$template") || return 1
+	[[ ${current%%$'\n'*} == "$uid" ]] || die "Pod controller $ns/$kind/$owner was replaced or is being deleted."
+	if [[ $kind == DaemonSet ]]; then
+		awk -F '|' -v key="$HOLD_KEY" -v uid="${LOCK_UID:-}" '
+			($4 == "" || $4 == "NoSchedule") &&
+			(($2 == "Exists" && ($1 == "" || $1 == key)) ||
+			 ($2 == "Equal" && $1 == key && uid != "" && $3 == uid)) { matches=1 }
+			END { exit !matches }
+		' <<<"$current" || die "DaemonSet $ns/$owner cannot replace pods on this worker under the maintenance hold. Review its template tolerations."
+	fi
+}
+
+check_node_daemonsets() {
+	awk -F '|' '
+		$1 == "pod" && $4 == "DaemonSet" {
+			id=$2 "/" $5 " " $8
+			if (FILENAME == ARGV[1]) required[id]=1
+			else if ($10 == "True") delete required[id]
+		}
+		END { for (id in required) print id }
+	' "$EVIDENCE_DIR/before-target-pods.txt" "$1" | sort >"$EVIDENCE_DIR/missing-node-daemonsets.txt" || return 1
+	[[ ! -s $EVIDENCE_DIR/missing-node-daemonsets.txt ]] || die "An inspected DaemonSet has no Ready pod on this worker. See $EVIDENCE_DIR/missing-node-daemonsets.txt."
+}
+
+check_storage() {
+	local file=$1 unsupported claims namespace claim volume result owners kind name uid api
+	unsupported=$(awk -F '|' '$1 == "toleration" || $1 == "hostPath" || $1 == "ephemeral" || $1 == "inlineCSI" || ($1 == "pod" && ($4 == "Unmanaged" || $4 == "Mirror"))' "$file") ||
+		return 1
+	if [[ $unsupported ]]; then
+		printf '%s\n' "$unsupported"
+		die 'Review node-local, ephemeral or unmanaged workloads and pods that tolerate the maintenance hold before draining.'
+	fi
+	owners=$(awk -F '|' '$1 == "pod" {print $2 "|" $4 "|" $5 "|" $8 "|" $9}' "$file" | sort -u) || return 1
+	while IFS='|' read -r namespace kind name uid api; do
+		[[ $namespace ]] || continue
+		check_controller "$namespace" "$kind" "$name" "$uid" "$api" || return 1
+	done <<<"$owners"
+	claims=$(awk -F '|' '$1 == "pvc" {print $2 "|" $4}' "$file" | sort -u) || return 1
+	while IFS='|' read -r namespace claim; do
+		[[ $claim ]] || continue
+		volume=$(kube -n "$namespace" get pvc "$claim" -o jsonpath='{.spec.volumeName}') || return 1
+		[[ $volume ]] || die "PVC $namespace/$claim is unbound."
+		result=$(kube get pv "$volume" -o go-template='{{if .spec.local}}local{{else if .spec.hostPath}}hostPath{{else if .spec.nodeAffinity}}nodeAffinity{{else}}noNodeAffinity{{end}}') ||
+			return 1
+		printf '%s/%s -> %s (%s)\n' "$namespace" "$claim" "$volume" "$result"
+		case "$result" in
+		local | hostPath) die "PVC $namespace/$claim is backed by node-local storage." ;;
+		esac
+	done <<<"$claims"
+}
+
+read_reservation() {
+	local state
+	state=$(kube -n kube-system get configmap "$LOCK_NAME" --ignore-not-found \
+		-o go-template='{{.metadata.uid}}|{{.metadata.resourceVersion}}|{{index .data "admin"}}|{{index .data "run"}}|{{index .data "node"}}') || die 'Could not read the worker maintenance reservation.'
+	IFS='|' read -r LOCK_UID LOCK_VERSION LOCK_ADMIN LOCK_RUN LOCK_NODE <<<"$state"
+}
+
+assert_lock() {
+	read_reservation
+	if ! valid_uuid "$LOCK_UID" || [[ $LOCK_ADMIN != "$ADMIN_ID" || $LOCK_RUN != "$RUN_ID" || $LOCK_NODE != "$NODE_NAME" ]]; then
+		die 'This run has no matching worker maintenance reservation.'
+	fi
+	if [[ -e $EVIDENCE_DIR/reservation-uid.txt ]]; then
+		[[ $(<"$EVIDENCE_DIR/reservation-uid.txt") == "$LOCK_UID" ]] || die 'The worker maintenance reservation was replaced.'
+	else
+		printf '%s\n' "$LOCK_UID" >"$RUN_DIR/reservation.tmp"
+		mv -- "$RUN_DIR/reservation.tmp" "$EVIDENCE_DIR/reservation-uid.txt"
+	fi
+}
+
+claim_lock() {
+	read_reservation
+	if [[ ! $LOCK_UID && ! -e $EVIDENCE_DIR/reservation-uid.txt ]]; then
+		kube -n kube-system create configmap "$LOCK_NAME" --from-literal="admin=$ADMIN_ID" \
+			--from-literal="run=$RUN_ID" --from-literal="node=$NODE_NAME" -o name ||
+			info 'Checking whether the reservation was created.'
+	fi
+	assert_lock
+}
+
+release_lock() {
+	read_reservation
+	[[ $LOCK_UID && $LOCK_UID == "$(<"$EVIDENCE_DIR/reservation-uid.txt")" ]] || return 0
+	[[ $LOCK_ADMIN == "$ADMIN_ID" && $LOCK_RUN == "$RUN_ID" && $LOCK_NODE == "$NODE_NAME" ]] ||
+		die 'Reservation ownership changed. Leaving it in place.'
+	[[ $LOCK_VERSION =~ ^[a-zA-Z0-9._:-]+$ ]] || die 'Invalid reservation resource version.'
+	printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$LOCK_UID" "$LOCK_VERSION" |
+		kube delete --raw "/api/v1/namespaces/kube-system/configmaps/$LOCK_NAME" -f - >"$EVIDENCE_DIR/lock-release.json"
+}
+
+owns_hold() {
+	[[ $NODE_HOLD && ${NODE_HOLD#*=} == "$LOCK_UID" ]]
+}
+
+set_hold() {
+	local operation=$1 path value patch
+	assert_lock
+	node_info
+	case "$operation" in
+	add)
+		[[ $NODE_BOOT == "$BASE_BOOT" && $NODE_KERNEL == "$BASE_KERNEL" && $SCHEDULING == schedulable ]] ||
+			die 'Worker identity or scheduling changed before the maintenance hold.'
+		if owns_hold; then
+			return 0
+		fi
+		[[ ! $NODE_HOLD && ! -e $RUN_DIR/held ]] || die 'Maintenance hold is missing or belongs to another run.'
+		path=/spec/taints
+		value=$(printf '{"key":"%s","effect":"NoSchedule","value":"%s"}' "$HOLD_KEY" "$LOCK_UID")
+		if [[ $TAINT_LIST ]]; then
+			path+=/-
+		else
+			value="[$value]"
+		fi
+		patch=$(printf '{"op":"add","path":"%s","value":%s}' "$path" "$value")
+		;;
+	remove)
+		[[ $NODE_BOOT == "$2" ]] || die 'Worker boot changed before releasing the scheduling hold.'
+		if ! owns_hold; then
+			[[ ! $NODE_HOLD && (-e $RUN_DIR/release-requested || ! -e $RUN_DIR/held) ]] ||
+				die 'This run no longer owns the maintenance hold. Review the node.'
+			return 0
+		fi
+		touch "$RUN_DIR/release-requested"
+		path=/spec/taints/${NODE_HOLD%%=*}
+		patch=$(printf '{"op":"test","path":"%s/value","value":"%s"},{"op":"remove","path":"%s"}' "$path" "$LOCK_UID" "$path")
+		;;
+	esac
+	# The version test protects the taint index and every field read in node_info.
+	patch=$(printf '[{"op":"test","path":"/metadata/uid","value":"%s"},{"op":"test","path":"/metadata/resourceVersion","value":"%s"},%s]' "$NODE_UID" "$NODE_VERSION" "$patch")
+	kube patch node "$NODE_NAME" --type=json -p "$patch" -o name
+}
+
+check_drain_owner() {
+	assert_lock
+	node_info
+	owns_hold && [[ $SCHEDULING == schedulable && $NODE_BOOT == "$BASE_BOOT" && $NODE_KERNEL == "$BASE_KERNEL" ]] ||
+		die 'Worker scheduling, identity or maintenance hold changed. Stopping drain.'
+}
+
+evict_reviewed_pods() {
+	local inventory=$1 deadline=$((SECONDS + DRAIN_SECONDS))
+	local row ns pod kind owner _phase uid owner_uid api state version message sent
+	local live_uid live_node live_owner deleting
+	while IFS='|' read -r row ns pod kind owner _phase uid owner_uid api; do
+		[[ $row == pod && $kind != DaemonSet ]] || continue
+		if ! valid_uuid "$uid" || ! valid_uuid "$owner_uid"; then
+			die "Pod $ns/$pod has no verified controller."
+		fi
+		sent=0
+		while :; do
+			((SECONDS < deadline)) || die "Drain timed out waiting for $ns/$pod."
+			# shellcheck disable=SC2016
+			state=$(kube -n "$ns" get pod "$pod" --ignore-not-found -o go-template='{{.metadata.uid}}|{{.metadata.resourceVersion}}|{{.spec.nodeName}}|{{range .metadata.ownerReferences}}{{if .controller}}{{.uid}}{{end}}{{end}}|{{if .metadata.deletionTimestamp}}terminating{{end}}') || return 1
+			[[ $state ]] || break
+			IFS='|' read -r live_uid version live_node live_owner deleting <<<"$state"
+			if [[ $live_uid != "$uid" && $live_node != "$NODE_NAME" ]]; then
+				break
+			fi
+			[[ $live_uid == "$uid" && $live_node == "$NODE_NAME" && $live_owner == "$owner_uid" && $version =~ ^[a-zA-Z0-9._:-]+$ ]] ||
+				die "Pod $ns/$pod changed since review. Leaving it in place."
+			if [[ ! $deleting && $sent == 0 ]]; then
+				check_drain_owner
+				check_controller "$ns" "$kind" "$owner" "$owner_uid" "$api" || return 1
+				if message=$(printf '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"%s"},"deleteOptions":{"preconditions":{"uid":"%s","resourceVersion":"%s"}}}\n' "$pod" "$ns" "$uid" "$version" |
+					kube create --raw "/api/v1/namespaces/$ns/pods/$pod/eviction" -f - 2>&1); then
+					info "Evicted $ns/$pod."
+					sent=1
+				else
+					printf '%s\n' "$message" >&2
+					[[ $message == *TooManyRequests* || $message == *'disruption budget'* ]] || return 1
+				fi
+			fi
+			sleep 2
+		done
+	done <"$inventory"
+}
+
+check_recovery() {
+	local label=$1 ready
+	collect_health "$label" || return 1
+	check_nodes "$EVIDENCE_DIR/$label-nodes.txt" || return 1
+	comm -23 "$EVIDENCE_DIR/$label-issues.txt" "$EVIDENCE_DIR/allowed-issues.txt" >"$EVIDENCE_DIR/$label-blockers.txt" || return 1
+	if [[ -s $EVIDENCE_DIR/$label-blockers.txt ]]; then
+		cat "$EVIDENCE_DIR/$label-blockers.txt" >&2
+		return 1
+	fi
+	ready=$(kube get --raw=/readyz) || return 1
+	[[ $ready == ok ]]
+}
+
+wait_cluster_health() {
+	local label=$1 deadline=$((SECONDS + WAIT_SECONDS))
+	until check_recovery "$label"; do
+		((SECONDS < deadline)) || die "Cluster health did not recover. Review $EVIDENCE_DIR/$label-*.txt."
+		sleep 5
+	done
+}
+
+cmd_inspect() {
+	local server
+	header "Inspect the cluster"
+
+	load_prepared "$TICKET_FILE"
+	if [[ $KUBECONFIG_FILE && $KUBECONFIG_FILE != /* ]]; then
+		KUBECONFIG_FILE="$PWD/$KUBECONFIG_FILE"
+	fi
+	printf '%s\n' "$KUBE_CONTEXT" >"$RUN_DIR/context"
+	printf '%s\n' "$KUBECONFIG_FILE" >"$RUN_DIR/kubeconfig"
+	printf '%s\n' "$SUDO_KUBECTL" >"$RUN_DIR/sudo-kubectl"
+	server=$(cluster_uid)
+	valid_uuid "$server" || die 'Unable to identify the Kubernetes cluster.'
+	printf '%s\n' "$server" >"$EVIDENCE_DIR/cluster-uid.txt"
+	node_info
+	[[ $SCHEDULING == schedulable && $NODE_BOOT == "$BASE_BOOT" && $NODE_KERNEL == "$BASE_KERNEL" ]] ||
+		die 'The target must be schedulable and match the prepared worker boot and kernel.'
+	[[ ! $NODE_HOLD ]] || die 'The target already has a maintenance hold.'
+	printf '%s\n' "$NODE_UID" >"$EVIDENCE_DIR/node-uid.txt"
+	printf '%s\n' "$PREPARED_TICKET" >"$EVIDENCE_DIR/prepared.ticket"
+	collect_health before
+	target_pods >"$EVIDENCE_DIR/before-target-pods.txt"
+	target_csi >"$EVIDENCE_DIR/before-csi.txt"
+	kube get pdb -A >"$EVIDENCE_DIR/before-pdb.txt"
+	kube get pv -o wide >"$EVIDENCE_DIR/before-pv.txt"
+	node_heartbeat >"$EVIDENCE_DIR/before-heartbeat.txt"
+	[[ -s $EVIDENCE_DIR/before-heartbeat.txt ]] || die "The worker has no recorded heartbeat: $NODE_NAME."
+	[[ $(kube get --raw=/readyz) == ok ]] || die 'Kubernetes API /readyz failed.'
+	check_nodes "$EVIDENCE_DIR/before-nodes.txt" || die 'Resolve node health before maintenance.'
+	od -An -N16 -tx1 /dev/urandom | tr -d ' \n' >"$RUN_DIR/admin-id"
+	touch "$RUN_DIR/inspected"
+	ok 'Inspect passed.'
+	info "Review the target pods, volumes, PDBs and baseline issues in $EVIDENCE_DIR."
+	if [[ -s $EVIDENCE_DIR/before-issues.txt ]]; then
+		cat "$EVIDENCE_DIR/before-issues.txt"
+	fi
+}
+
+review_existing_issues() {
+	local unreviewed
+
+	if [[ $ALLOWED_ISSUES_FILE ]]; then
+		[[ -f $ALLOWED_ISSUES_FILE ]] || die "Issue allowlist not found: $ALLOWED_ISSUES_FILE"
+		sort -u -- "$ALLOWED_ISSUES_FILE" >"$RUN_DIR/allowed-candidate"
+		unreviewed=$(comm -23 "$RUN_DIR/allowed-candidate" "$EVIDENCE_DIR/before-issues.txt")
+		[[ ! $unreviewed ]] ||
+			die 'The issue allowlist must use exact rows from before-issues.txt.'
+		mv -- "$RUN_DIR/allowed-candidate" "$EVIDENCE_DIR/allowed-issues.txt"
+	elif [[ ! -e $EVIDENCE_DIR/allowed-issues.txt ]]; then
+		: >"$EVIDENCE_DIR/allowed-issues.txt"
+	fi
+}
+
+cmd_drain() {
+	local eviction_api unreviewed
+	header "Drain the worker"
+
+	load_cluster
+	[[ ! -e $RUN_DIR/release-requested && ! -e $RUN_DIR/finished ]] || die 'This run already entered the return or cancel phase.'
+	[[ ! -s $EVIDENCE_DIR/drained.ticket ]] || die "Drain already passed. Reuse $EVIDENCE_DIR/drained.ticket."
+	review_existing_issues
+	wait_node_heartbeat pre-drain
+	node_info
+	[[ $NODE_BOOT == "$BASE_BOOT" && $NODE_KERNEL == "$BASE_KERNEL" ]] ||
+		die 'The target worker boot or kernel changed after prepare.'
+	[[ $SCHEDULING == schedulable ]] || die 'Another operator cordoned the worker. Leaving it in place.'
+	read_reservation
+	if [[ $LOCK_UID || $NODE_HOLD ]]; then
+		assert_lock
+		[[ ! $NODE_HOLD ]] || owns_hold || die 'Another run holds the worker.'
+	fi
+	check_recovery pre-drain || die 'Cluster pre-drain checks failed.'
+	eviction_api=$(kube get --raw=/api/v1)
+	grep -Eq '"name"[[:space:]]*:[[:space:]]*"pods/eviction"' <<<"$eviction_api" ||
+		die 'The server does not advertise the pod eviction API.'
+	target_pods >"$EVIDENCE_DIR/pre-drain-target-pods.txt"
+	check_node_daemonsets "$EVIDENCE_DIR/pre-drain-target-pods.txt"
+	record "$EVIDENCE_DIR/pre-drain-storage.txt" check_storage "$EVIDENCE_DIR/pre-drain-target-pods.txt"
+	if grep -q '^emptyDir|' "$EVIDENCE_DIR/pre-drain-target-pods.txt"; then
+		((ALLOW_EMPTYDIR)) || die 'Review emptyDir volumes and opt in with --allow-emptydir.'
+	fi
+	unreviewed=$(comm -23 "$EVIDENCE_DIR/pre-drain-target-pods.txt" "$EVIDENCE_DIR/before-target-pods.txt" |
+		awk -F '|' '$1 != "pod" || $4 != "DaemonSet"')
+	[[ ! $unreviewed ]] || die 'Workload inventory changed since inspect. Review the current inventory and start a fresh inspect.'
+
+	claim_lock
+	set_hold add >"$EVIDENCE_DIR/hold.txt"
+	touch "$RUN_DIR/held"
+	check_drain_owner
+	target_pods >"$EVIDENCE_DIR/held-target-pods.txt"
+	comm -23 "$EVIDENCE_DIR/held-target-pods.txt" "$EVIDENCE_DIR/pre-drain-target-pods.txt" |
+		awk -F '|' '$1 != "pod" || $4 != "DaemonSet"' >"$EVIDENCE_DIR/hold-inventory-changes.txt"
+	[[ ! -s $EVIDENCE_DIR/hold-inventory-changes.txt ]] ||
+		die 'The workload or volume inventory changed while placing the maintenance hold. Review the changes before retrying drain.'
+	record "$EVIDENCE_DIR/drain.txt" evict_reviewed_pods "$EVIDENCE_DIR/held-target-pods.txt" ||
+		die 'Drain did not complete. Review the drain output before running maintenance.'
+	wait_cluster_health drained
+	check_drain_owner
+	# Pods can be bound directly to a tainted node.
+	target_pods >"$EVIDENCE_DIR/drained-target-pods.txt"
+	awk -F '|' '
+		$1 == "pod" && $4 != "DaemonSet" {
+			print
+			bad=1
+		}
+		END { exit bad }
+	' "$EVIDENCE_DIR/drained-target-pods.txt" ||
+		die 'Workload pods are still on the worker. Review the pod list before retrying the drain.'
+	check_storage "$EVIDENCE_DIR/drained-target-pods.txt"
+	check_node_daemonsets "$EVIDENCE_DIR/drained-target-pods.txt"
+	check_drain_owner
+	printf '%s\n' "drained-v2|$LOCK_UID|$PREPARED_TICKET" >"$RUN_DIR/drained.tmp"
+	mv -- "$RUN_DIR/drained.tmp" "$EVIDENCE_DIR/drained.ticket"
+	ok 'Drain and workload checks passed.'
+	info "Send $EVIDENCE_DIR/drained.ticket to the worker."
+}
+
+check_returned_worker() {
+	local new_boot=$1
+
+	target_csi >"$EVIDENCE_DIR/pre-return-csi.txt"
+	comm -23 "$EVIDENCE_DIR/before-csi.txt" "$EVIDENCE_DIR/pre-return-csi.txt" >"$EVIDENCE_DIR/pre-return-missing-csi.txt"
+	[[ ! -s $EVIDENCE_DIR/pre-return-missing-csi.txt ]] ||
+		die "A CSI registration is missing. See $EVIDENCE_DIR/pre-return-missing-csi.txt."
+	node_info
+	[[ $NODE_BOOT == "$new_boot" ]] || die "Kubernetes does not report the verified boot on $NODE_NAME."
+	target_pods >"$EVIDENCE_DIR/pre-return-target-pods.txt"
+	check_node_daemonsets "$EVIDENCE_DIR/pre-return-target-pods.txt"
+}
+
+cmd_return() {
+	local verified new_boot
+	header "Return the worker to service"
+
+	load_cluster
+	[[ -s $EVIDENCE_DIR/drained.ticket ]] || die 'Return requires a completed drain.'
+	load_drain_ticket "$EVIDENCE_DIR/drained.ticket"
+	[[ $DRAIN_UID == "$(<"$EVIDENCE_DIR/reservation-uid.txt")" ]] || die 'Drain ticket and reservation do not match.'
+	verified=$(cat -- "$TICKET_FILE")
+	IFS='|' read -r _ new_boot _ <<<"$verified"
+	if ! valid_uuid "$new_boot" || [[ $verified != "verified-v2|$new_boot|$DRAIN_TICKET" ]]; then
+		die 'The verify ticket does not belong to this worker run.'
+	fi
+	if ((REBOOT_REQUIRED)); then
+		[[ $new_boot != "$BASE_BOOT" ]] || die 'The verify ticket does not prove a new boot for this worker run.'
+	else
+		[[ $new_boot == "$BASE_BOOT" ]] || die 'The verify ticket reports an unexpected reboot.'
+	fi
+	if [[ -e $RUN_DIR/finished ]]; then
+		release_lock
+		info 'This cluster run already passed its return checks.'
+		return
+	fi
+	assert_lock
+	wait_cluster_health pre-return
+	wait_node_heartbeat pre-return
+	check_returned_worker "$new_boot"
+	check_recovery pre-release || die 'Cluster health changed before releasing the maintenance hold. Review the pre-release evidence and retry return.'
+	set_hold remove "$new_boot" >"$EVIDENCE_DIR/release-hold.txt"
+	wait_cluster_health returned
+	node_info
+	[[ $NODE_BOOT == "$new_boot" ]] || die 'Worker boot changed during return.'
+	printf '%s\n' "$verified" >"$EVIDENCE_DIR/verified.ticket"
+	touch "$RUN_DIR/finished"
+	release_lock
+	ok "Maintenance and recovery checks passed. Worker scheduling flag: $SCHEDULING."
+}
+
+cmd_cancel() {
+	header "Cancel the drain"
+
+	load_cluster
+	[[ ! -s $EVIDENCE_DIR/drained.ticket ]] ||
+		die 'Cancel is available after an incomplete drain and before a drain ticket is issued.'
+	if [[ -e $RUN_DIR/finished ]]; then
+		release_lock
+		info 'This cluster run was already cancelled.'
+		return
+	fi
+	assert_lock
+	wait_node_heartbeat pre-cancel
+	node_info
+	[[ $NODE_BOOT == "$BASE_BOOT" && $NODE_KERNEL == "$BASE_KERNEL" ]] ||
+		die 'The node changed after prepare. See Manual recovery in docs/maintenance.md.'
+	set_hold remove "$BASE_BOOT" >"$EVIDENCE_DIR/release-hold.txt"
+	wait_cluster_health cancelled
+	node_info
+	[[ $NODE_BOOT == "$BASE_BOOT" ]] || die 'Worker boot changed during cancellation.'
+	touch "$RUN_DIR/finished"
+	release_lock
+	ok "Drain cancelled. Worker scheduling flag: $SCHEDULING."
+}
+
+cmd_help() {
+	cat <<-'EOF'
+		Usage: k8s-maintenance PHASE --run DIR [options]
+
+		On the worker:
+		  prepare --node NAME --ip IPV4 [--action FILE] [--check FILE] [--reboot]
+		  apply   --ticket drained.ticket [--retry-action]
+		  verify    Run the worker check after a reboot or retry a failed check.
+		  reboot    Retry the reboot request after a successful action.
+		Use --action for a Bash maintenance script, or --reboot for a reboot-only run.
+
+		In the Kubernetes admin session:
+		  inspect --ticket prepared.ticket [--kubeconfig FILE] --context NAME [--sudo-kubectl]
+		  drain   [--allow-emptydir] [--allow-existing FILE] [--drain-timeout SECONDS]
+		  return  --ticket verified.ticket
+		  cancel    Release this run's hold after an incomplete drain, before a drain ticket exists.
+		Use --wait SECONDS with drain, return or cancel (default 300).
+
+		In either session:
+		  archive   Archive evidence and write its SHA-256 checksum.
+
+		prepare and inspect create separate private run directories. Transfer only the
+		small ticket files between sessions using your existing transfer route.
+		See docs/maintenance.md for a complete example.
+	EOF
+}
+
+parse_args() {
+	local value
+	while (($#)); do
+		value=${2:-}
+		case "$1:$PHASE" in
+		--help:"$PHASE")
+			cmd_help
+			exit
+			;;
+		--sudo-kubectl:inspect)
+			SUDO_KUBECTL=1
+			shift
+			continue
+			;;
+		--allow-emptydir:drain)
+			ALLOW_EMPTYDIR=1
+			shift
+			continue
+			;;
+		--retry-action:apply)
+			RETRY_ACTION=1
+			shift
+			continue
+			;;
+		--reboot:prepare)
+			REBOOT_REQUIRED=1
+			shift
+			continue
+			;;
+		--run:"$PHASE")
+			RUN_DIR=$value
+			;;
+		--ticket:inspect | --ticket:apply | --ticket:return)
+			TICKET_FILE=$value
+			;;
+		--node:prepare)
+			NODE_NAME=$value
+			;;
+		--ip:prepare)
+			NODE_IP=$value
+			;;
+		--action:prepare)
+			ACTION_FILE=$value
+			;;
+		--check:prepare)
+			CHECK_FILE=$value
+			;;
+		--context:inspect)
+			KUBE_CONTEXT=$value
+			;;
+		--kubeconfig:inspect)
+			KUBECONFIG_FILE=$value
+			;;
+		--allow-existing:drain)
+			ALLOWED_ISSUES_FILE=$value
+			;;
+		--wait:drain | --wait:return | --wait:cancel)
+			WAIT_SECONDS=$value
+			;;
+		--drain-timeout:drain)
+			DRAIN_SECONDS=$value
+			;;
+		*) die "Unknown option for $PHASE: $1" ;;
+		esac
+		[[ $value && $value != --* ]] || die "Missing value for $1."
+		shift 2
+	done
+}
+
+validate_args() {
+	[[ $RUN_DIR ]] || die 'Specify --run DIR.'
+	[[ $WAIT_SECONDS =~ ^[1-9][0-9]{0,4}$ && $DRAIN_SECONDS =~ ^[1-9][0-9]{0,4}$ ]] ||
+		die 'Timeouts must be positive integer seconds.'
+
+	case "$PHASE" in
+	prepare)
+		[[ $NODE_NAME && $NODE_IP ]] || die 'prepare requires --node and --ip.'
+		[[ $ACTION_FILE || $REBOOT_REQUIRED == 1 ]] || die 'prepare requires --action or --reboot.'
+		;;
+	inspect)
+		[[ $KUBE_CONTEXT && -f $TICKET_FILE ]] || die 'inspect requires --context and --ticket prepared.ticket.'
+		if ((SUDO_KUBECTL)) && [[ ! $KUBECONFIG_FILE ]]; then
+			die 'Specify --kubeconfig when using --sudo-kubectl.'
+		fi
+		;;
+	apply | return)
+		[[ -f $TICKET_FILE ]] || die "$PHASE requires a ticket from the preceding phase."
+		;;
+	esac
+}
+
+init_run_dir() {
+	local mode
+	if [[ $PHASE == prepare || $PHASE == inspect ]]; then
+		mkdir -m 700 -- "$RUN_DIR" || die 'Use a new run directory whose parent already exists.'
+	fi
+	[[ -d $RUN_DIR && -O $RUN_DIR && ! -L $RUN_DIR ]] || die 'Use a private run directory owned by the operator.'
+	RUN_DIR=$(CDPATH='' cd -- "$RUN_DIR" && pwd -P)
+	mode=$(stat -c '%a' "$RUN_DIR" 2>/dev/null || stat -f '%Lp' "$RUN_DIR")
+	[[ $mode == *00 ]] || die 'The run directory must be private to its owner.'
+	EVIDENCE_DIR=$RUN_DIR/evidence
+	if [[ $PHASE == prepare || $PHASE == inspect ]]; then
+		mkdir -- "$EVIDENCE_DIR"
+		printf '%s\n' "$PHASE" >"$RUN_DIR/type"
+	fi
+	[[ -f $RUN_DIR/type && -d $EVIDENCE_DIR && -O $EVIDENCE_DIR && ! -L $EVIDENCE_DIR ]] || die "Run directory is incomplete: $RUN_DIR"
+
+	mkdir -- "$RUN_DIR/.busy" || die "Run is busy: $RUN_DIR (see the recovery section before clearing .busy)."
+}
+
+main() {
+	PHASE=${1:-help}
+	case "$PHASE" in
+	help | -h | --help)
+		cmd_help
+		return
+		;;
+	esac
+
+	local cmd_fn="cmd_$PHASE"
+	is_fn "$cmd_fn" || die "Unknown phase '$PHASE'. See k8s-maintenance --help."
+	shift
+	parse_args "$@"
+	validate_args
+	init_run_dir
+
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	trap 'exit 129' HUP
+	trap cleanup EXIT
+
+	case "$PHASE:$(cat "$RUN_DIR/type")" in
+	prepare:prepare | inspect:inspect | drain:inspect | return:inspect | cancel:inspect | archive:*) ;;
+	apply:prepare | reboot:prepare | verify:prepare)
+		load_prepared "$EVIDENCE_DIR/prepared.ticket"
+		;;
+	*) die "$PHASE requires the run directory created for its worker or admin session." ;;
+	esac
+
+	"$cmd_fn"
+}
+
+main "$@"
